@@ -12,5 +12,8 @@ outputs/
 *.swp
 *.swo
 
-# Personal notes / meeting prep
-docs/meeting_prep*
+# Personal notes / docs (not project deliverables)
+docs/
+
+# Test images from internet
+test_images/

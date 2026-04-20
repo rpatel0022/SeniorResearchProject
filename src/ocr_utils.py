@@ -145,7 +145,7 @@ def _visualize_detections(
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    from synthetic_data import generate_sample_table_image
+    from src.synthetic_data import generate_sample_table_image
 
     path = sys.argv[1] if len(sys.argv) > 1 else generate_sample_table_image()
     bbs, texts = bb_and_text_from_table_image(path)
