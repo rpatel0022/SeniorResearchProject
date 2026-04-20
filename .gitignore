@@ -11,3 +11,6 @@ outputs/
 .DS_Store
 *.swp
 *.swo
+
+# Personal notes / meeting prep
+docs/meeting_prep*

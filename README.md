@@ -1,174 +1,91 @@
-# Multimodal Table Alignment Pipeline
+# Table-Text Alignment Project
 
-**This prototype aligns OCR-extracted text from table images with the corresponding visual regions so that text and image patches representing the same content become close in embedding space.**
+**Aligns OCR-extracted text from table images with corresponding visual regions inside a VLM's representation space, providing semantic anchors that improve VLM reasoning on table content.**
 
-## What It Does
+This is a research project under [Haz Sameen Shahgir](https://github.com/Patchwork53), building on the findings from [VLMs Need Words](https://arxiv.org/abs/2604.02486) and [LatentLens](https://arxiv.org/abs/2602.00462).
 
-Given a table image, this pipeline:
+## Project Goal
 
-1. Detects text regions using OCR (EasyOCR) and extracts bounding boxes + text strings.
-2. Encodes each cropped image region using CLIP's vision encoder.
-3. Encodes each OCR text string using CLIP's text encoder.
-4. Computes an alignment score (cosine similarity) between matched image-text pairs.
-5. Trains lightweight projection heads to improve alignment between matched pairs.
-6. Visualizes everything: annotated OCR output, similarity heatmaps, training curves.
+VLMs route visual reasoning through language — they perform well when they can name what they see, but fail on unnamed entities (see VLMs Need Words). Table cells containing arbitrary values ("$2.47", "SKU-8827") are effectively unnamed entities. This project adds an **alignment loss** during VLM fine-tuning that pairs OCR-extracted text with corresponding image regions, giving the model explicit semantic anchors for every cell.
 
-## Architecture Overview
+### Pipeline
 
-```
-Table Image
-    │
-    ├──> EasyOCR ──> Bounding Boxes + Text Strings
-    │                    │                │
-    │                    ▼                ▼
-    │            CLIP Vision         CLIP Text
-    │             Encoder             Encoder
-    │                │                │
-    │                ▼                ▼
-    │         Image Embeddings   Text Embeddings
-    │              [N, 512]        [N, 512]
-    │                │                │
-    │                ▼                ▼
-    │         ┌─────────────────────────┐
-    │         │  Trainable Projection   │
-    │         │      Heads (MLP)        │
-    │         └─────────────────────────┘
-    │                │                │
-    │                ▼                ▼
-    │         Projected Image    Projected Text
-    │           [N, 256]           [N, 256]
-    │                │                │
-    │                └──── Cosine ────┘
-    │                    Similarity
-    │                       │
-    │                       ▼
-    │               Alignment Loss
-    │          (cosine or contrastive)
-    │                       │
-    │                  Backprop to
-    │              projection heads
-    └──────────────────────────────────
+```python
+# bb_to_image_embeddings()  → [DONE] VLM hidden state extraction (reference code)
+# bb_and_text_from_table_image()  → [DONE] OCR with EasyOCR
+# get_text_embedding()  → [In progress] LatentLens-inspired experimentation
+
+bbs, texts = bb_and_text_from_table_image(image)
+
+alignment_loss = 0
+for bb, text in zip(bbs, texts):
+    text_embedding = get_text_embedding(text)
+    image_embedding = bb_to_image_embeddings(bb)
+    loss = -cosine_sim(text_embedding, image_embedding)
+    alignment_loss += loss
+
+loss = task_loss + w * alignment_loss
+loss.backwards()
 ```
 
 ## Project Structure
 
 ```
-├── requirements.txt          # Python dependencies
-├── README.md                 # This file
 ├── src/
-│   ├── synthetic_data.py     # Generate sample table images
-│   ├── ocr_utils.py          # OCR detection and visualization
-│   ├── embedding_utils.py    # CLIP image/text encoding
-│   ├── losses.py             # Cosine and contrastive loss functions
-│   ├── train.py              # Training loop with projection heads
+│   ├── ocr_utils.py          # bb_and_text_from_table_image() — EasyOCR detection
+│   ├── synthetic_data.py     # Generate sample table images for testing
+│   ├── embedding_utils.py    # CLIP-based embeddings (prototype/baseline)
+│   ├── losses.py             # Alignment loss functions
+│   ├── train.py              # Prototype training loop (CLIP-based)
 │   └── demo.py               # End-to-end demo script
-├── tests/
-│   ├── test_ocr.py           # OCR function tests
-│   ├── test_embeddings.py    # Embedding function tests
-│   ├── test_loss.py          # Loss function tests
-│   └── test_train.py         # Training loop tests
-└── outputs/                  # Generated artifacts (created at runtime)
+├── tests/                    # pytest suite (40 tests)
+├── docs/
+│   └── meeting_prep_apr20.md # Meeting prep notes
+├── requirements.txt
+└── README.md
 ```
+
+### Core deliverable: `bb_and_text_from_table_image()`
+
+Located in `src/ocr_utils.py`. Uses EasyOCR to:
+- Detect text regions in a table image
+- Return bounding boxes as `(x1, y1, x2, y2)` + extracted text strings
+- Filter low-confidence and empty detections
+- Optionally save annotated visualization
+
+### Prototype: CLIP-based alignment demo
+
+The files `embedding_utils.py`, `losses.py`, `train.py`, and `demo.py` implement a standalone prototype using CLIP for embeddings and trainable projection heads. This demonstrates the alignment concept but uses a different architecture than the research pipeline (which uses Qwen3-VL hidden states).
 
 ## Setup
 
 ```bash
-# Create a virtual environment (recommended)
 python -m venv venv
-source venv/bin/activate  # macOS/Linux
-# venv\Scripts\activate   # Windows
-
-# Install dependencies
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**Note:** The first run will download the CLIP model (~600 MB) and EasyOCR models (~100 MB). Subsequent runs use cached models.
-
-## Running the Demo
+## Usage
 
 ```bash
-# Basic demo with synthetic table image
+# Run CLIP-based prototype demo
 python -m src.demo
 
-# Custom options
-python -m src.demo --epochs 300 --loss_type contrastive
-
-# Use your own table image
-python -m src.demo --image_path path/to/table.png
-
-# All options
-python -m src.demo --help
-```
-
-### Command-Line Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--image_path` | None | Path to a table image |
-| `--use_synthetic` | True | Generate a synthetic table image |
-| `--epochs` | 200 | Number of training epochs |
-| `--lr` | 0.001 | Learning rate |
-| `--loss_type` | cosine | Loss function: `cosine` or `contrastive` |
-| `--output_dir` | outputs | Directory for saved artifacts |
-
-## Running Tests
-
-```bash
-# Run all tests
+# Run tests
 pytest tests/ -v -s
-
-# Run individual test files
-pytest tests/test_ocr.py -v -s
-pytest tests/test_embeddings.py -v -s
-pytest tests/test_loss.py -v -s
-pytest tests/test_train.py -v -s
 ```
 
-## Expected Outputs
+## Key References
 
-After running `python -m src.demo`, you should see:
+- [VLMs Need Words](https://arxiv.org/abs/2604.02486) — Shahgir et al. VLMs fail on unnamed visual entities; semantic anchors fix this
+- [LatentLens](https://arxiv.org/abs/2602.00462) — Krojer et al. Training-free interpretability revealing that mid-layer VLM hidden states are shared semantic spaces
+- [Reference code](https://github.com/Patchwork53/VLMs-Need-Words-Public/blob/main/shape_correspond/rep_qwen_squiggles.py) — `bb_to_image_embeddings` implementation using Qwen3-VL
 
-### Console Output
-- Number of OCR detections with bounding boxes and text
-- CLIP embedding shapes and sample values
-- Similarity matrix before training (text rows x image columns)
-- Epoch-by-epoch training loss
-- Similarity matrix after training
-- Retrieval accuracy before and after
+## Status
 
-### Saved Files (in `outputs/`)
-| File | Description |
-|------|-------------|
-| `sample_table.png` | The synthetic table image |
-| `ocr_annotated.png` | Table image with bounding boxes drawn |
-| `crops/crop_0.png` ... | Individual cropped text regions |
-| `sim_before.png` | Heatmap of similarity matrix before training |
-| `sim_after.png` | Heatmap of similarity matrix after training |
-| `training_loss.png` | Loss curve over training epochs |
-
-### What "Good" Looks Like
-- **Before training:** Similarity matrix diagonal values are moderate and not clearly higher than off-diagonal.
-- **After training:** Diagonal values (matched pairs) should be noticeably higher than off-diagonal values.
-- **Loss curve:** Should decrease smoothly from initial value.
-- **Retrieval accuracy:** Should improve (often reaching 1.0 on the small synthetic dataset).
-
-## Limitations
-
-This is a research prototype, not a production system. Key limitations:
-
-- **OCR noise:** EasyOCR may miss cells, merge adjacent text, or produce errors depending on font, resolution, and layout.
-- **Tiny dataset:** Training on a single image with ~10 text regions is far from realistic. The training loop demonstrates the concept but would need hundreds/thousands of examples for real generalization.
-- **Projection-head-only training:** The CLIP backbone is frozen. We only train lightweight MLP heads on top, which limits how much the alignment can improve.
-- **No table structure modeling:** The pipeline treats each text region independently. It does not model rows, columns, headers, or cell relationships.
-- **Not a document understanding system:** This does not parse table semantics, extract key-value pairs, or understand document layout beyond OCR-level detection.
-- **Cosine similarity baseline:** CLIP embeddings are already somewhat aligned for natural image-text pairs, but OCR text fragments (like "$2" or "Qty") are not typical CLIP training data.
-
-## Suggestions for Future Improvements
-
-- **More training data:** Use a dataset of real table images (e.g., PubTabNet, TableBank) instead of synthetic ones.
-- **Fine-tune CLIP:** Unfreeze some CLIP layers for deeper adaptation.
-- **Table structure awareness:** Use table detection models (e.g., DETR-based) to identify rows/columns before alignment.
-- **Better OCR:** Try PaddleOCR or cloud OCR APIs for higher accuracy.
-- **Cross-attention alignment:** Replace projection heads with a cross-attention mechanism between image patches and text tokens.
-- **Evaluation metrics:** Add NDCG, MRR, and Recall@K for proper retrieval evaluation.
-- **Data augmentation:** Apply image augmentations (rotation, noise, blur) to improve robustness.
+- [x] Lit review — cell-level table alignment appears novel (closest: DoCo, CVPR 2024)
+- [x] `bb_and_text_from_table_image()` — implemented and tested with EasyOCR
+- [x] Understand `bb_to_image_embeddings()` from reference code
+- [ ] `get_text_embedding()` — needs LatentLens-inspired experimentation
+- [ ] Integration with Qwen3-VL pipeline
+- [ ] Evaluation on real table datasets
