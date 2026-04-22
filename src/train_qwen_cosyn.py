@@ -17,7 +17,7 @@ from torch.nn.utils import clip_grad_norm_
 
 from transformers import (
     AutoProcessor,
-    Qwen2_5_VLForConditionalGeneration,
+    Qwen3VLForConditionalGeneration,
     get_cosine_schedule_with_warmup,
 )
 from datasets import load_dataset
@@ -271,7 +271,7 @@ def main(config: Config):
     print(f"[train] Loading processor and model: {config.model_name}")
     processor = AutoProcessor.from_pretrained(config.model_name, trust_remote_code=True)
 
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
         config.model_name,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
