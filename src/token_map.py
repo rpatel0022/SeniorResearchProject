@@ -208,9 +208,10 @@ def find_qwen3vl_image_tokens(
 # ---------------------------------------------------------------------------
 
 def bb_to_token_indices(
-    image_path: str,
-    bbs: List[Tuple[int, int, int, int]],
-    processor: AutoProcessor,
+    image_path: Optional[str] = None,
+    pil_image: Optional[Image.Image] = None,
+    bbs: List[Tuple[int, int, int, int]] = [],
+    processor: Optional[AutoProcessor] = None,
     device: str = "cpu",
 ) -> List[List[int]]:
     """
@@ -220,7 +221,8 @@ def bb_to_token_indices(
     the processed resolution and converted to patch-grid positions.
 
     Args:
-        image_path: Path to the table image.
+        image_path: Path to the table image (provide this OR pil_image).
+        pil_image:  PIL Image object (alternative to image_path).
         bbs:        List of (x1, y1, x2, y2) bboxes from OCR.
         processor:  Loaded AutoProcessor for Qwen3-VL.
         device:     Torch device string.
@@ -232,19 +234,25 @@ def bb_to_token_indices(
     # during unit-test stubs — the real pipeline will always have it.
     from qwen_vl_utils import process_vision_info  # type: ignore
 
-    if not Path(image_path).exists():
-        raise FileNotFoundError(f"[token_map] Image not found: {image_path}")
+    if pil_image is not None:
+        img = pil_image.convert("RGB")
+    elif image_path is not None:
+        if not Path(image_path).exists():
+            raise FileNotFoundError(f"[token_map] Image not found: {image_path}")
+        img = Image.open(image_path).convert("RGB")
+    else:
+        raise ValueError("Must provide either image_path or pil_image")
 
-    pil_image = Image.open(image_path).convert("RGB")
-    orig_w, orig_h = pil_image.size
+    orig_w, orig_h = img.size
     print(f"[token_map] Original image size: {orig_w}x{orig_h}")
 
     # --- Build minimal prompt following Qwen3-VL docs ---
+    # Use PIL image directly in the message for both file and PIL paths
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": f"file://{image_path}"},
+                {"type": "image", "image": img},
                 {"type": "text", "text": "Describe this table."},
             ],
         }
