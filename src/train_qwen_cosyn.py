@@ -71,6 +71,10 @@ class Config:
     alignment_loss_weight: float = 1.0e-5
     precomputed_dir: str = "data/preprocessed"
     alignment_layer: int = 16
+    # Runtime knobs
+    attn_implementation: str = "sdpa"  # "flash_attention_2" requires flash-attn install
+    num_train_samples: int = 0  # 0 = use full split; >0 = slice for smoke tests
+    num_val_samples: int = 0    # 0 = use full split; >0 = slice for smoke tests
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +496,7 @@ def main(config: Config):
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         config.model_name,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation=config.attn_implementation,
         trust_remote_code=True,
     )
 
@@ -553,6 +557,14 @@ def main(config: Config):
         )
         train_split = split["train"]
         val_split = split["test"]
+
+    # Optional slicing for smoke tests
+    if config.num_train_samples > 0:
+        n = min(config.num_train_samples, len(train_split))
+        train_split = train_split.select(range(n))
+    if config.num_val_samples > 0:
+        n = min(config.num_val_samples, len(val_split))
+        val_split = val_split.select(range(n))
 
     print(f"[train] Train rows: {len(train_split)} | Val rows: {len(val_split)}")
 
@@ -779,6 +791,24 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--alignment_layer", type=int, default=Config.alignment_layer
+    )
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default=Config.attn_implementation,
+        help='Attention backend: "sdpa" (default), "flash_attention_2", "eager"',
+    )
+    parser.add_argument(
+        "--num_train_samples",
+        type=int,
+        default=Config.num_train_samples,
+        help="Slice train split to N rows (0 = full). Useful for smoke tests.",
+    )
+    parser.add_argument(
+        "--num_val_samples",
+        type=int,
+        default=Config.num_val_samples,
+        help="Slice val split to N rows (0 = full). Useful for smoke tests.",
     )
 
     args = parser.parse_args()
