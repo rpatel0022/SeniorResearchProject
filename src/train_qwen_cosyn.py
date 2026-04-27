@@ -29,7 +29,7 @@ from torch.nn.utils import clip_grad_norm_
 
 from transformers import (
     AutoProcessor,
-    Qwen2_5_VLForConditionalGeneration,
+    Qwen3VLForConditionalGeneration,
     get_cosine_schedule_with_warmup,
 )
 from datasets import load_dataset
@@ -469,7 +469,7 @@ def main(config: Config):
         config.model_name, trust_remote_code=True
     )
 
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
         config.model_name,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
@@ -477,9 +477,10 @@ def main(config: Config):
     )
 
     # --- Freeze vision encoder + MLP (per Sameen, 2026-04-22) ---
-    # Only the LM layers (model.model.layers, embed_tokens, norm, lm_head) train.
-    model.visual.requires_grad_(False)
-    frozen_params = sum(p.numel() for p in model.visual.parameters())
+    # Only the LM layers (model.model.language_model.layers, embed_tokens, norm,
+    # lm_head) train.
+    model.model.visual.requires_grad_(False)
+    frozen_params = sum(p.numel() for p in model.model.visual.parameters())
     trainable_params = sum(
         p.numel() for p in model.parameters() if p.requires_grad
     )
@@ -504,10 +505,11 @@ def main(config: Config):
     if config.alignment_loss_weight > 0:
 
         def alignment_hook(module, input, output):
-            # output is a tuple; output[0] is the hidden state tensor
-            captured_hidden["hidden"] = output[0]
+            # Qwen3VLTextDecoderLayer.forward returns the hidden state tensor
+            # directly (not a tuple), so we capture `output` as-is.
+            captured_hidden["hidden"] = output
 
-        hook_handle = model.model.layers[
+        hook_handle = model.model.language_model.layers[
             config.alignment_layer
         ].register_forward_hook(alignment_hook)
         print(
