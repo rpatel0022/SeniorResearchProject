@@ -61,11 +61,14 @@ class Config:
     warmup_ratio: float = 0.1
     per_device_batch_size: int = 2
     grad_accum_steps: int = 8
-    max_seq_len: int = 2048
+    max_seq_len: int = 4096
     max_grad_norm: float = 1.0
     log_every: int = 50
     # Alignment loss config
-    alignment_loss_weight: float = 0.01
+    # Calibrated 2026-04-27 on 30 CoSyn samples (layer 16, mean-pool MSE on raw
+    # bf16 hidden states): mean task=4.53, mean align=44,291. Per issue #5, w
+    # is set so w*align ~= 0.1*task on average.
+    alignment_loss_weight: float = 1.0e-5
     precomputed_dir: str = "data/preprocessed"
     alignment_layer: int = 16
 
@@ -141,17 +144,19 @@ class CoSynTableDataset(Dataset):
 
         for row in hf_split:
             image = row["image"]
-            qa_pairs = row.get("qa_pairs", [])
-            if not qa_pairs:
+            # CoSyn-400K stores qa_pairs as a dict-of-lists:
+            #   {'question': [...], 'explanation': [...], 'answer': [...]}
+            qa_pairs = row.get("qa_pairs", {}) or {}
+            questions = qa_pairs.get("question", []) if isinstance(qa_pairs, dict) else []
+            answers = qa_pairs.get("answer", []) if isinstance(qa_pairs, dict) else []
+            if not questions or not answers:
                 continue
 
             img_hash = _image_hash(image) if compute_hash else ""
             if img_hash in self.hash_to_alignment:
                 alignment_matches += 1
 
-            for qa in qa_pairs:
-                question = qa.get("question", "")
-                answer = qa.get("answer", "")
+            for question, answer in zip(questions, answers):
                 if not question or not answer:
                     continue
                 self.items.append({
@@ -169,7 +174,7 @@ class CoSynTableDataset(Dataset):
     def __len__(self) -> int:
         return len(self.items)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def __getitem__(self, idx: int, _attempts: int = 0) -> Dict[str, Any]:
         item = self.items[idx]
         image = item["image"]
         question = item["question"]
@@ -215,17 +220,25 @@ class CoSynTableDataset(Dataset):
         # Process images via qwen_vl_utils
         image_inputs, _ = process_vision_info(messages_full)
 
-        # Encode full sequence
-        encoded = self.processor(
-            text=[full_text],
-            images=image_inputs,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_seq_len,
-        )
+        # Encode full sequence. Some CoSyn tables produce more image tokens
+        # than max_seq_len allows; truncation then mismatches the special-token
+        # count and the processor raises. Skip-ahead a few times before giving up.
+        try:
+            encoded = self.processor(
+                text=[full_text],
+                images=image_inputs,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_seq_len,
+            )
+        except ValueError:
+            if _attempts >= 5:
+                raise
+            return self.__getitem__((idx + 1) % len(self), _attempts + 1)
 
         input_ids = encoded["input_ids"].squeeze(0)
         attention_mask = encoded["attention_mask"].squeeze(0)
+        mm_token_type_ids = encoded["mm_token_type_ids"].squeeze(0)
         pixel_values = encoded["pixel_values"]
         image_grid_thw = encoded["image_grid_thw"]
 
@@ -245,6 +258,7 @@ class CoSynTableDataset(Dataset):
         result = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
+            "mm_token_type_ids": mm_token_type_ids,
             "labels": labels,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
@@ -285,6 +299,11 @@ def collate_fn(
         batch_first=True,
         padding_value=0,
     )
+    mm_token_type_ids = pad_sequence(
+        [item["mm_token_type_ids"] for item in batch],
+        batch_first=True,
+        padding_value=0,  # 0 = text token; padded positions are masked by attention_mask
+    )
     labels = pad_sequence(
         [item["labels"] for item in batch],
         batch_first=True,
@@ -298,6 +317,7 @@ def collate_fn(
     result = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
+        "mm_token_type_ids": mm_token_type_ids,
         "labels": labels,
         "pixel_values": pixel_values,
         "image_grid_thw": image_grid_thw,
