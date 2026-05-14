@@ -42,6 +42,7 @@ from src.token_map import (
     scale_bbox,
     find_qwen3vl_image_tokens,
 )
+from src.losses import compute_lm_head_bow_loss
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +72,12 @@ class Config:
     alignment_loss_weight: float = 1.0e-5
     precomputed_dir: str = "data/preprocessed"
     alignment_layer: int = 16
+    # Alignment loss mode:
+    #   "mse"          — raw L2 between pooled visual rep and precomputed text rep (original spec)
+    #   "lm_head_bow"  — CE between lm_head(pooled visual rep) and OCR cell tokens (BoW)
+    alignment_loss_mode: str = "mse"
+    # If "lm_head_bow", optionally apply the final LM norm before lm_head
+    lm_head_bow_use_final_norm: bool = True
     # Runtime knobs
     attn_implementation: str = "sdpa"  # "flash_attention_2" requires flash-attn install
     num_train_samples: int = 0  # 0 = use full split; >0 = slice for smoke tests
@@ -129,6 +136,13 @@ class CoSynTableDataset(Dataset):
 
                 for pt_path in pt_files:
                     pt = torch.load(pt_path, weights_only=False)
+                    cell_texts = pt.get("texts", [])
+                    # Pre-tokenize cell texts for lm_head_bow loss (no special tokens).
+                    # Cheap on CPU and avoids re-tokenizing every epoch.
+                    cell_token_ids = [
+                        processor.tokenizer.encode(t or "", add_special_tokens=False)
+                        for t in cell_texts
+                    ]
                     self.hash_to_alignment[pt["image_hash"]] = {
                         "bboxes": pt["bboxes"],
                         # Only keep the layer we need: [num_cells, hidden_dim]
@@ -136,6 +150,7 @@ class CoSynTableDataset(Dataset):
                             :, alignment_layer, :
                         ].clone(),
                         "image_size": pt["image_size"],
+                        "cell_token_ids": cell_token_ids,
                     }
                 print(
                     f"[dataset] Loaded {len(self.hash_to_alignment)} "
@@ -276,6 +291,7 @@ class CoSynTableDataset(Dataset):
             result["alignment_bboxes"] = align["bboxes"]
             result["alignment_text_reps"] = align["text_reps"]
             result["alignment_image_size"] = align["image_size"]
+            result["alignment_cell_token_ids"] = align["cell_token_ids"]
         else:
             result["has_alignment"] = False
 
@@ -340,6 +356,9 @@ def collate_fn(
     result["alignment_image_size"] = [
         item.get("alignment_image_size", (0, 0)) for item in batch
     ]
+    result["alignment_cell_token_ids"] = [
+        item.get("alignment_cell_token_ids", []) for item in batch
+    ]
 
     return result
 
@@ -352,27 +371,36 @@ def compute_alignment_loss(
     layer_hidden: torch.Tensor,
     batch: Dict[str, Any],
     image_grid_thw: torch.Tensor,
+    *,
+    mode: str = "mse",
+    lm_head: Optional[torch.nn.Module] = None,
+    final_norm: Optional[torch.nn.Module] = None,
 ) -> torch.Tensor:
     """
-    Compute raw L2 (MSE) alignment loss between visual token representations
-    at the hooked layer and precomputed text-only representations.
+    Per-cell alignment loss. Steps shared across modes:
+      1. Scale OCR bboxes to the processor's resolution.
+      2. Map bboxes → visual token indices in the sequence.
+      3. Mean-pool hidden states at those positions → per-cell visual_rep.
 
-    For each image with alignment data:
-      1. Scale OCR bboxes to the processor's resolution
-      2. Map bboxes → visual token indices in the sequence
-      3. Mean-pool hidden states at those positions → visual_rep
-      4. Compare to precomputed text_rep via MSE in fp32
+    Per-cell target depends on `mode`:
+      - "mse":         compare visual_rep to precomputed text_rep with MSE (fp32).
+      - "lm_head_bow": decode visual_rep through (detached) lm_head; CE against
+                       OCR cell tokens as a bag-of-words.
 
     Args:
-        layer_hidden: Hidden states from hooked layer [batch, seq_len, hidden_dim].
-        batch: Dict with alignment metadata (has_alignment, bboxes, text_reps, etc).
-        image_grid_thw: Image grid tensor [batch, 3] for resolution computation.
+        layer_hidden:    [batch, seq_len, hidden_dim] from the hooked LM layer.
+        batch:           dict with alignment metadata.
+        image_grid_thw:  [batch, 3] image grid tensor.
+        mode:            "mse" or "lm_head_bow".
+        lm_head:         required when mode == "lm_head_bow".
+        final_norm:      optional final LM norm to apply before lm_head.
 
     Returns:
-        Scalar MSE loss in fp32, or 0.0 if no alignment data in this batch.
+        Scalar loss, or 0.0 if no alignment data in this batch.
     """
     visual_reps = []
     text_reps = []
+    cell_token_ids: List[List[int]] = []
 
     for i in range(layer_hidden.shape[0]):
         if not batch["has_alignment"][i]:
@@ -380,6 +408,7 @@ def compute_alignment_loss(
 
         bboxes = batch["alignment_bboxes"][i]
         text_reps_i = batch["alignment_text_reps"][i]  # [num_cells, hidden_dim]
+        token_ids_i = batch.get("alignment_cell_token_ids", [[]] * layer_hidden.shape[0])[i]
         orig_w, orig_h = batch["alignment_image_size"][i]
 
         # Processed resolution for this image
@@ -410,15 +439,31 @@ def compute_alignment_loss(
 
             visual_reps.append(visual_rep)
             text_reps.append(text_reps_i[j])
+            cell_token_ids.append(token_ids_i[j] if j < len(token_ids_i) else [])
 
     if not visual_reps:
         return torch.tensor(0.0, device=layer_hidden.device, requires_grad=False)
 
-    # Raw L2 (MSE) in fp32 for numerical stability
-    visual_stack = torch.stack(visual_reps).float()
-    text_stack = torch.stack(text_reps).to(visual_stack.device).float()
+    if mode == "mse":
+        # Raw L2 (MSE) in fp32 for numerical stability
+        visual_stack = torch.stack(visual_reps).float()
+        text_stack = torch.stack(text_reps).to(visual_stack.device).float()
+        return F.mse_loss(visual_stack, text_stack)
 
-    return F.mse_loss(visual_stack, text_stack)
+    elif mode == "lm_head_bow":
+        assert lm_head is not None, "lm_head required for mode='lm_head_bow'"
+        # Keep visual_stack in the model's compute dtype (bf16) — fp32 cast happens
+        # internally in compute_lm_head_bow_loss for the log_softmax.
+        visual_stack = torch.stack(visual_reps)
+        return compute_lm_head_bow_loss(
+            visual_reps=visual_stack,
+            cell_token_ids=cell_token_ids,
+            lm_head=lm_head,
+            final_norm=final_norm,
+        )
+
+    else:
+        raise ValueError(f"Unknown alignment_loss_mode: '{mode}'")
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +487,7 @@ def run_validation(model, val_loader, accelerator) -> float:
                 "alignment_bboxes",
                 "alignment_text_reps",
                 "alignment_image_size",
+                "alignment_cell_token_ids",
             ]:
                 batch.pop(key, None)
 
@@ -525,6 +571,8 @@ def main(config: Config):
     # Tensor is NOT detached — gradients flow through the LM layers.
     captured_hidden: Dict[str, torch.Tensor] = {}
     hook_handle = None
+    lm_head_module = None
+    final_norm_module = None
 
     if config.alignment_loss_weight > 0:
 
@@ -540,6 +588,21 @@ def main(config: Config):
             f"[train] Alignment hook registered on layer {config.alignment_layer}"
         )
         print(f"[train] Alignment loss weight: {config.alignment_loss_weight}")
+        print(f"[train] Alignment loss mode: {config.alignment_loss_mode}")
+
+        if config.alignment_loss_mode == "lm_head_bow":
+            # Resolve lm_head and final norm modules. Qwen3-VL exposes lm_head at
+            # the top level; the final pre-head norm lives inside the LM submodule.
+            lm_head_module = model.lm_head
+            if config.lm_head_bow_use_final_norm:
+                final_norm_module = getattr(model.model.language_model, "norm", None)
+                if final_norm_module is None:
+                    print("[train] WARNING: lm_head_bow_use_final_norm=True but no "
+                          "language_model.norm found; proceeding without it.")
+            print(
+                f"[train] lm_head_bow: lm_head={type(lm_head_module).__name__}, "
+                f"final_norm={'on' if final_norm_module is not None else 'off'}"
+            )
 
     # --- Load dataset ---
     print(
@@ -649,6 +712,7 @@ def main(config: Config):
                 alignment_bboxes = batch.pop("alignment_bboxes")
                 alignment_text_reps = batch.pop("alignment_text_reps")
                 alignment_image_size = batch.pop("alignment_image_size")
+                alignment_cell_token_ids = batch.pop("alignment_cell_token_ids")
 
                 # Keep a copy for alignment computation (before model consumes it)
                 image_grid_thw_raw = batch["image_grid_thw"].clone()
@@ -668,12 +732,16 @@ def main(config: Config):
                         "alignment_bboxes": alignment_bboxes,
                         "alignment_text_reps": alignment_text_reps,
                         "alignment_image_size": alignment_image_size,
+                        "alignment_cell_token_ids": alignment_cell_token_ids,
                         "input_ids": batch["input_ids"],
                     }
                     alignment_loss = compute_alignment_loss(
                         captured_hidden["hidden"],
                         align_batch,
                         image_grid_thw_raw,
+                        mode=config.alignment_loss_mode,
+                        lm_head=lm_head_module,
+                        final_norm=final_norm_module,
                     )
                     captured_hidden.clear()
                 else:
@@ -791,6 +859,22 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--alignment_layer", type=int, default=Config.alignment_layer
+    )
+    parser.add_argument(
+        "--alignment_loss_mode",
+        type=str,
+        default=Config.alignment_loss_mode,
+        choices=["mse", "lm_head_bow"],
+        help='Alignment loss formulation. "mse" matches the original spec; '
+             '"lm_head_bow" decodes pooled visual reps via frozen lm_head and CE '
+             'against OCR cell tokens (bag-of-words).',
+    )
+    parser.add_argument(
+        "--lm_head_bow_use_final_norm",
+        action=argparse.BooleanOptionalAction,
+        default=Config.lm_head_bow_use_final_norm,
+        help="When --alignment_loss_mode=lm_head_bow, apply the final LM norm "
+             "(detached) before lm_head. Default on.",
     )
     parser.add_argument(
         "--attn_implementation",
