@@ -14,7 +14,7 @@ from typing import List, Tuple, Optional, Dict, Any
 
 import torch
 from PIL import Image
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 
 # ---------------------------------------------------------------------------
@@ -30,18 +30,17 @@ VISION_END_ID: int = 151653
 # ---------------------------------------------------------------------------
 # Module-level model / processor cache — load once, reuse everywhere
 # ---------------------------------------------------------------------------
-_model: Optional[Qwen2_5_VLForConditionalGeneration] = None
+_model: Optional[Qwen3VLForConditionalGeneration] = None
 _processor: Optional[AutoProcessor] = None
 
 
 def load_qwen3vl(
     model_name: str = "Qwen/Qwen3-VL-2B-Instruct",
     device: str = "cpu",
-) -> Tuple[Qwen2_5_VLForConditionalGeneration, AutoProcessor]:
+) -> Tuple[Qwen3VLForConditionalGeneration, AutoProcessor]:
     """
     Lazily load Qwen3-VL model and processor (cached at module level).
 
-    Qwen3-VL uses the Qwen2_5_VL* classes from transformers.
     Model is loaded in bfloat16 to reduce memory pressure.
 
     Args:
@@ -58,7 +57,7 @@ def load_qwen3vl(
         _processor = AutoProcessor.from_pretrained(model_name)
 
         print(f"[token_map] Loading Qwen3-VL model (bfloat16) on {device}...")
-        _model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        _model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
         ).to(device)
