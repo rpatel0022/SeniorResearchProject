@@ -33,9 +33,16 @@ from src.token_map import (
     scale_bbox,
     find_qwen3vl_image_tokens,
 )
+from src.losses import compute_lm_head_bow_loss
 
 
-def main(num_samples: int, alignment_layer: int, max_seq_len: int) -> None:
+def main(
+    num_samples: int,
+    alignment_layer: int,
+    max_seq_len: int,
+    alignment_loss_mode: str,
+    use_final_norm: bool,
+) -> None:
     device = torch.device("cuda")
     model_name = "Qwen/Qwen3-VL-2B-Instruct"
 
@@ -57,6 +64,18 @@ def main(num_samples: int, alignment_layer: int, max_seq_len: int) -> None:
 
     h = model.model.language_model.layers[alignment_layer].register_forward_hook(hook)
     print(f"[calib] hook on layer {alignment_layer}, visual frozen")
+    print(f"[calib] mode={alignment_loss_mode}", end="")
+    if alignment_loss_mode == "lm_head_bow":
+        print(f" (final_norm={'on' if use_final_norm else 'off'})")
+    else:
+        print()
+
+    lm_head_module = model.lm_head if alignment_loss_mode == "lm_head_bow" else None
+    final_norm_module = None
+    if alignment_loss_mode == "lm_head_bow" and use_final_norm:
+        final_norm_module = getattr(model.model.language_model, "norm", None)
+        if final_norm_module is None:
+            print("[calib] WARNING: final_norm requested but model.model.language_model.norm not found")
 
     # --- Load N alignment files and remember which row_ids we need ---
     pt_files = sorted(glob.glob("data/preprocessed/*.pt"))[:num_samples]
@@ -66,6 +85,7 @@ def main(num_samples: int, alignment_layer: int, max_seq_len: int) -> None:
         pt = torch.load(f, weights_only=False)
         needed[pt["row_id"]] = {
             "bboxes": pt["bboxes"],
+            "texts": pt["texts"],
             "text_reps": pt["text_hidden_states"][:, alignment_layer, :].clone(),
             "image_size": pt["image_size"],
             "hash": pt["image_hash"],
@@ -108,6 +128,7 @@ def main(num_samples: int, alignment_layer: int, max_seq_len: int) -> None:
     # --- Forward pass on each, compute both losses ---
     task_losses = []
     align_losses = []
+    all_cell_nlls: list = []  # flattened per-cell NLLs across all examples (lm_head_bow only)
 
     for i, item in enumerate(matched):
         image = item["image"]
@@ -184,6 +205,7 @@ def main(num_samples: int, alignment_layer: int, max_seq_len: int) -> None:
 
         visual_reps = []
         text_reps = []
+        cell_token_ids: list = []
         for j, bbox in enumerate(align["bboxes"]):
             scaled = scale_bbox(bbox, orig_w, orig_h, processed_w, processed_h)
             tok_idxs = find_qwen3vl_image_tokens(
@@ -197,6 +219,11 @@ def main(num_samples: int, alignment_layer: int, max_seq_len: int) -> None:
                 continue
             visual_reps.append(layer_hidden[0, valid, :].mean(dim=0))
             text_reps.append(align["text_reps"][j])
+            if alignment_loss_mode == "lm_head_bow":
+                cell_text = align["texts"][j] if j < len(align["texts"]) else ""
+                cell_token_ids.append(
+                    processor.tokenizer.encode(cell_text or "", add_special_tokens=False)
+                )
 
         captured.clear()
 
@@ -204,15 +231,48 @@ def main(num_samples: int, alignment_layer: int, max_seq_len: int) -> None:
             print(f"[calib] {i+1}/{len(matched)}: no valid visual tokens, skipping")
             continue
 
-        v = torch.stack(visual_reps).float()
-        t = torch.stack(text_reps).to(device).float()
-        align_loss = F.mse_loss(v, t).item()
+        if alignment_loss_mode == "mse":
+            v = torch.stack(visual_reps).float()
+            t = torch.stack(text_reps).to(device).float()
+            align_loss = F.mse_loss(v, t).item()
+            n_cells_used = len(visual_reps)
+        else:  # lm_head_bow
+            v_stack = torch.stack(visual_reps)  # keep in bf16; loss casts to fp32 internally
+            align_loss_t = compute_lm_head_bow_loss(
+                visual_reps=v_stack,
+                cell_token_ids=cell_token_ids,
+                lm_head=lm_head_module,
+                final_norm=final_norm_module,
+            )
+            align_loss = align_loss_t.item()
+            # Per-cell NLL distribution (mirror the math inside compute_lm_head_bow_loss
+            # so we can report quantiles without changing the loss function's API).
+            h_fp = v_stack
+            if final_norm_module is not None:
+                w = final_norm_module.weight.detach()
+                eps = getattr(final_norm_module, "variance_epsilon", getattr(final_norm_module, "eps", 1e-6))
+                in_dtype = h_fp.dtype
+                h_fp = h_fp.float()
+                var = h_fp.pow(2).mean(-1, keepdim=True)
+                h_fp = h_fp * torch.rsqrt(var + eps)
+                h_fp = (h_fp * w.float()).to(in_dtype)
+            W = lm_head_module.weight.detach()
+            b = lm_head_module.bias.detach() if lm_head_module.bias is not None else None
+            logits = F.linear(h_fp, W, b)
+            log_probs = F.log_softmax(logits.float(), dim=-1)
+            for j, ids in enumerate(cell_token_ids):
+                if not ids:
+                    continue
+                ids_t = torch.tensor(ids, device=log_probs.device, dtype=torch.long)
+                nll = -log_probs[j, ids_t].mean().item()
+                all_cell_nlls.append(nll)
+            n_cells_used = sum(1 for ids in cell_token_ids if ids)
 
         task_losses.append(task_loss)
         align_losses.append(align_loss)
         print(
             f"[calib] {i+1}/{len(matched)}: "
-            f"task={task_loss:.4f}  align={align_loss:.4f}  cells={len(visual_reps)}"
+            f"task={task_loss:.4f}  align={align_loss:.4f}  cells={n_cells_used}"
         )
 
     h.remove()
@@ -227,6 +287,8 @@ def main(num_samples: int, alignment_layer: int, max_seq_len: int) -> None:
     align_std = statistics.stdev(align_losses) if len(align_losses) > 1 else 0.0
 
     print("\n=== Calibration Summary ===")
+    print(f"  mode:             {alignment_loss_mode}")
+    print(f"  layer:            {alignment_layer}")
     print(f"  examples used:    {len(task_losses)}")
     print(f"  mean task_loss:   {task_mean:.4f}  (std {task_std:.4f})")
     print(f"  mean align_loss:  {align_mean:.4f}  (std {align_std:.4f})")
@@ -235,11 +297,52 @@ def main(num_samples: int, alignment_layer: int, max_seq_len: int) -> None:
     print(f"  recommended alignment_loss_weight = 0.1 * task / align = {w:.6f}")
     print(f"    (so w * align_loss ~= 0.1 * task_loss on average)")
 
+    if alignment_loss_mode == "lm_head_bow" and all_cell_nlls:
+        nlls = sorted(all_cell_nlls)
+        n = len(nlls)
+        p50 = nlls[n // 2]
+        p95 = nlls[min(n - 1, int(0.95 * n))]
+        nll_mean = statistics.mean(nlls)
+        nll_std = statistics.stdev(nlls) if n > 1 else 0.0
+        print(f"\n=== Per-cell NLL distribution (lm_head_bow) ===")
+        print(f"  cells:            {n}")
+        print(f"  mean:             {nll_mean:.4f}  (std {nll_std:.4f})")
+        print(f"  p50 / p95:        {p50:.4f}  /  {p95:.4f}")
+        print(f"  min / max:        {nlls[0]:.4f}  /  {nlls[-1]:.4f}")
+        print(f"  random-vocab NLL: ~11.93  (log(151643))")
+
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--num-samples", type=int, default=20)
     p.add_argument("--alignment-layer", type=int, default=16)
     p.add_argument("--max-seq-len", type=int, default=2048)
+    p.add_argument(
+        "--alignment-loss-mode",
+        type=str,
+        default="mse",
+        choices=["mse", "lm_head_bow"],
+        help="Loss mode to probe. 'mse' (default, original behavior) compares "
+             "visual reps to precomputed text reps. 'lm_head_bow' decodes visual "
+             "reps through the frozen LM head and computes CE against OCR text.",
+    )
+    p.add_argument(
+        "--lm-head-bow-use-final-norm",
+        action="store_true",
+        default=True,
+        help="Apply final RMSNorm (detached) before lm_head in lm_head_bow mode (default: on).",
+    )
+    p.add_argument(
+        "--no-lm-head-bow-use-final-norm",
+        dest="lm_head_bow_use_final_norm",
+        action="store_false",
+        help="Disable the final norm in lm_head_bow mode.",
+    )
     args = p.parse_args()
-    main(args.num_samples, args.alignment_layer, args.max_seq_len)
+    main(
+        args.num_samples,
+        args.alignment_layer,
+        args.max_seq_len,
+        args.alignment_loss_mode,
+        args.lm_head_bow_use_final_norm,
+    )
