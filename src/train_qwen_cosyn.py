@@ -17,6 +17,9 @@ Design decisions (per Sameen, 2026-04-22):
 
 import argparse
 import hashlib
+import json
+import os
+import shutil
 from dataclasses import dataclass
 from glob import glob as glob_files
 from typing import List, Dict, Any, Optional
@@ -82,6 +85,14 @@ class Config:
     attn_implementation: str = "sdpa"  # "flash_attention_2" requires flash-attn install
     num_train_samples: int = 0  # 0 = use full split; >0 = slice for smoke tests
     num_val_samples: int = 0    # 0 = use full split; >0 = slice for smoke tests
+    # Mid-epoch checkpointing (0 = disabled, only end-of-epoch best_model save)
+    save_steps: int = 0
+    save_total_limit: int = 2
+    resume_from: str = ""
+    # Train only on items whose image has matching precomputed alignment data
+    # (every batch contributes alignment gradient). Val is always unfiltered
+    # so EM eval stays comparable across runs.
+    aligned_only: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +120,11 @@ class CoSynTableDataset(Dataset):
         max_seq_len: int,
         precomputed_dir: Optional[str] = None,
         alignment_layer: int = 16,
+        aligned_only: bool = False,
     ):
         self.processor = processor
         self.max_seq_len = max_seq_len
+        self.aligned_only = aligned_only
         self.items: List[Dict[str, Any]] = []
 
         # --- Load precomputed alignment data ---
@@ -174,6 +187,9 @@ class CoSynTableDataset(Dataset):
             img_hash = _image_hash(image) if compute_hash else ""
             if img_hash in self.hash_to_alignment:
                 alignment_matches += 1
+            elif self.aligned_only:
+                # Skip rows whose image lacks precomputed alignment data
+                continue
 
             for question, answer in zip(questions, answers):
                 if not question or not answer:
@@ -642,6 +658,7 @@ def main(config: Config):
         config.max_seq_len,
         precomputed_dir=precomputed,
         alignment_layer=config.alignment_layer,
+        aligned_only=config.aligned_only,
     )
     val_dataset = CoSynTableDataset(val_split, processor, config.max_seq_len)
     print(
@@ -699,13 +716,50 @@ def main(config: Config):
     # --- Training loop ---
     best_val_loss = float("inf")
     global_step = 0
+    resume_epoch = 1
+
+    # --- Resume from checkpoint (if requested) ---
+    if config.resume_from:
+        if not os.path.isdir(config.resume_from):
+            raise FileNotFoundError(
+                f"--resume_from path does not exist: {config.resume_from}"
+            )
+        print(f"[train] Resuming from {config.resume_from}")
+        accelerator.load_state(config.resume_from)
+        state_path = os.path.join(config.resume_from, "training_state.json")
+        if os.path.exists(state_path):
+            with open(state_path) as f:
+                state = json.load(f)
+            global_step = int(state.get("global_step", 0))
+            resume_epoch = int(state.get("epoch", 1))
+        print(f"[train] Resumed at epoch={resume_epoch} step={global_step}")
+
+    steps_per_epoch = len(train_loader) // config.grad_accum_steps
 
     for epoch in range(1, config.num_epochs + 1):
+        if epoch < resume_epoch:
+            continue
         model.train()
         running_task_loss = 0.0
         running_align_loss = 0.0
+        running_align_count = 0  # micro-batches with non-zero alignment loss
 
-        for step, batch in enumerate(train_loader, start=1):
+        # On the resume epoch, skip the micro-batches already consumed.
+        loader_for_epoch = train_loader
+        if config.resume_from and epoch == resume_epoch and global_step > 0:
+            steps_in_prior_epochs = (resume_epoch - 1) * steps_per_epoch
+            optim_steps_into_epoch = global_step - steps_in_prior_epochs
+            micro_batches_to_skip = optim_steps_into_epoch * config.grad_accum_steps
+            if micro_batches_to_skip > 0:
+                print(
+                    f"[train] skipping {micro_batches_to_skip} micro-batches "
+                    f"({optim_steps_into_epoch} optimizer steps) in epoch {epoch}"
+                )
+                loader_for_epoch = accelerator.skip_first_batches(
+                    train_loader, micro_batches_to_skip
+                )
+
+        for step, batch in enumerate(loader_for_epoch, start=1):
             with accelerator.accumulate(model):
                 # Separate alignment metadata before passing to model
                 has_alignment = batch.pop("has_alignment")
@@ -760,7 +814,10 @@ def main(config: Config):
                 optimizer.zero_grad()
 
             running_task_loss += task_loss.detach().item()
-            running_align_loss += alignment_loss.detach().item()
+            align_val = alignment_loss.detach().item()
+            running_align_loss += align_val
+            if align_val != 0.0:
+                running_align_count += 1
 
             if accelerator.sync_gradients:
                 global_step += 1
@@ -769,17 +826,47 @@ def main(config: Config):
                     global_step % config.log_every == 0
                     and accelerator.is_main_process
                 ):
-                    avg_task = running_task_loss / config.log_every
-                    avg_align = running_align_loss / config.log_every
+                    # log_every counts optimizer steps; accumulation is over
+                    # log_every * grad_accum_steps micro-batches.
+                    n_micro = config.log_every * config.grad_accum_steps
+                    avg_task = running_task_loss / n_micro
+                    avg_align = (
+                        running_align_loss / running_align_count
+                        if running_align_count > 0
+                        else 0.0
+                    )
+                    align_frac = running_align_count / n_micro
                     lr_now = scheduler.get_last_lr()[0]
                     print(
                         f"[train] epoch={epoch} step={global_step} "
                         f"task_loss={avg_task:.4f} "
                         f"align_loss={avg_align:.4f} "
+                        f"align_frac={align_frac:.3f} "
                         f"lr={lr_now:.2e}"
                     )
                     running_task_loss = 0.0
                     running_align_loss = 0.0
+                    running_align_count = 0
+
+                # --- Mid-epoch checkpoint save ---
+                if config.save_steps > 0 and global_step % config.save_steps == 0:
+                    state_dir = f"{config.output_dir}/checkpoint-{global_step}"
+                    accelerator.save_state(state_dir)
+                    if accelerator.is_main_process:
+                        with open(f"{state_dir}/training_state.json", "w") as fh:
+                            json.dump(
+                                {"epoch": epoch, "global_step": global_step}, fh
+                            )
+                        # Rotation: keep last save_total_limit; preserve best_model/
+                        existing = sorted(
+                            glob_files(f"{config.output_dir}/checkpoint-*"),
+                            key=lambda p: int(p.rsplit("-", 1)[-1]),
+                        )
+                        while len(existing) > config.save_total_limit:
+                            old = existing.pop(0)
+                            shutil.rmtree(old, ignore_errors=True)
+                            print(f"[train] rotated out {old}")
+                        print(f"[train] saved checkpoint to {state_dir}")
 
         # --- Validation at end of each epoch ---
         print(f"[train] Running validation after epoch {epoch}...")
@@ -893,6 +980,36 @@ if __name__ == "__main__":
         type=int,
         default=Config.num_val_samples,
         help="Slice val split to N rows (0 = full). Useful for smoke tests.",
+    )
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=Config.save_steps,
+        help="Save a full training state (model+optimizer+scheduler+RNG) every "
+             "N optimizer steps. 0 disables mid-epoch saves (only end-of-epoch "
+             "best_model is kept).",
+    )
+    parser.add_argument(
+        "--save_total_limit",
+        type=int,
+        default=Config.save_total_limit,
+        help="Keep at most this many checkpoint-* dirs (best_model/ is always "
+             "preserved). Older ones are deleted in order.",
+    )
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=Config.resume_from,
+        help="Path to a checkpoint-* dir to resume training from. Restores "
+             "model, optimizer, scheduler, RNG, epoch, and global_step.",
+    )
+    parser.add_argument(
+        "--aligned_only",
+        action="store_true",
+        default=Config.aligned_only,
+        help="Train only on items whose image has matching precomputed "
+             "alignment data (every batch contributes alignment gradient). "
+             "Val split is always unfiltered for comparability across runs.",
     )
 
     args = parser.parse_args()
