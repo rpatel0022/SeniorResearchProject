@@ -8,6 +8,9 @@ dist/
 build/
 .pytest_cache/
 outputs/
+
+# Precomputed alignment data (1050 .pt files, ~7GB; regenerable via src.preprocess_cosyn)
+data/
 .DS_Store
 *.swp
 *.swo
