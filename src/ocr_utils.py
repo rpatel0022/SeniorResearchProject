@@ -28,7 +28,8 @@ def _get_reader(gpu: bool = False) -> easyocr.Reader:
 
 
 def bb_and_text_from_table_image(
-    image_path: str,
+    image_path: Optional[str] = None,
+    pil_image: Optional[Image.Image] = None,
     gpu: bool = False,
     min_confidence: float = 0.20,
     visualize: bool = True,
@@ -38,7 +39,8 @@ def bb_and_text_from_table_image(
     Detect text regions in a table image and extract bounding boxes + OCR text.
 
     Args:
-        image_path:      Path to the input image.
+        image_path:      Path to the input image (provide this OR pil_image).
+        pil_image:       PIL Image object (alternative to image_path).
         gpu:             Whether to use GPU for OCR.
         min_confidence:  Minimum OCR confidence to keep a detection.
         visualize:       If True, save an annotated image with boxes drawn.
@@ -49,19 +51,23 @@ def bb_and_text_from_table_image(
         texts: List of OCR-extracted strings (same length as bbs).
     """
     # --- Load image ---
-    if not Path(image_path).exists():
-        raise FileNotFoundError(f"Image not found: {image_path}")
-
-    img_cv = cv2.imread(image_path)
-    if img_cv is None:
-        raise ValueError(f"Could not read image at {image_path}")
+    if pil_image is not None:
+        img_cv = cv2.cvtColor(np.array(pil_image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    elif image_path is not None:
+        if not Path(image_path).exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+        img_cv = cv2.imread(image_path)
+        if img_cv is None:
+            raise ValueError(f"Could not read image at {image_path}")
+    else:
+        raise ValueError("Must provide either image_path or pil_image")
 
     reader = _get_reader(gpu=gpu)
 
     # --- Run OCR ---
     # EasyOCR returns list of (bbox_polygon, text, confidence)
     # bbox_polygon is [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] (quadrilateral)
-    raw_results = reader.readtext(image_path)
+    raw_results = reader.readtext(img_cv)
     print(f"[ocr_utils] Raw OCR detections: {len(raw_results)}")
 
     bbs: List[Tuple[int, int, int, int]] = []
@@ -99,7 +105,7 @@ def bb_and_text_from_table_image(
         print(f"  [{i}] box={bb}  text='{txt}'")
 
     # --- Visualization ---
-    if visualize:
+    if visualize and image_path is not None:
         _visualize_detections(image_path, bbs, texts, output_dir)
 
     return bbs, texts
@@ -148,5 +154,5 @@ if __name__ == "__main__":
     from src.synthetic_data import generate_sample_table_image
 
     path = sys.argv[1] if len(sys.argv) > 1 else generate_sample_table_image()
-    bbs, texts = bb_and_text_from_table_image(path)
+    bbs, texts = bb_and_text_from_table_image(image_path=path)
     print(f"\nTotal detections: {len(bbs)}")
